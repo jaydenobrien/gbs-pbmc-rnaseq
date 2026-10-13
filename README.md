@@ -6,7 +6,7 @@ The manuscript is preprinted at bioRxiv: <https://www.biorxiv.org/content/10.110
 
 # Code
 
-The following code files are included:
+The following code files are included in src/:
 
 - **1_sc_object_creation.R**: Code used to take .h5 CellBender outputs, perform initial QC and processing steps on a per-sample basis, and integrate samples into a single Seurat object for downstream analysis.
 
