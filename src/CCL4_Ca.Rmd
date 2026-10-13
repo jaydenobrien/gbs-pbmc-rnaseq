@@ -1,0 +1,363 @@
+---
+title: "CCL4 Ca Imaging"
+author: "JAO"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(openxlsx)
+library(dplyr)
+library(ggplot2)
+library(rstatix)
+library(ggpubr)
+library(tidyverse)
+source("src", "utils.R") # load custom functions
+
+file <- "CCL4_Ca_Master_V2.xlsx"
+dir <- dirname(file)
+ca_data <- read.xlsx(file, sheet = "Sheet1")
+ca_data$Condition <- factor(ca_data$Condition, levels = c("Vehicle", "CCL4"))
+```
+
+```{r n}
+n <- ca_data |> group_by(Condition) |> summarise(n=n())
+```
+
+```{r percentage of responders}
+##Settings
+COND <- "CCL4" #c("Vehicle", "CCL4")
+
+# plot
+ca_data |> 
+  mutate(Responder = as.factor(Responder)) |>
+  group_by(Responder, Condition) |>
+  summarise(n = n()) |>
+  group_by(Condition) |>
+  mutate(percent = n/sum(n)*100) |>
+  ggplot(aes(x = Condition, y = percent, fill = Responder)) +
+  geom_col(color = "black") +
+  scale_fill_manual(values=c("white", "red")) +
+  geom_text(aes(label = paste0(n)), position = position_stack(vjust=0.5)) +
+  theme_classic()
+
+saveThePlot(file.path(dir, paste0("Cap_Responders_Bar_")),  w = 3, h = 4)
+
+# Fishers
+ca_data |> 
+  mutate(Responder = as.factor(Responder)) |>
+  group_by(Responder, Condition) |>
+  summarise(n = n()) |>
+  pivot_wider(names_from = Condition, values_from = n) |>
+  column_to_rownames(var = "Responder") |>
+  as.matrix() |>
+  fisher.test()
+```
+
+```{r donor and coverslip aware cap response proportions}
+ca_data |> 
+  mutate(Responder = as.factor(Responder)) |>
+  group_by(Donor, Responder, Condition) |>
+  summarise(n = n()) |>
+  pivot_wider(
+    names_from = Responder,
+    values_from = n,
+  ) |>
+  mutate(prop = `1` / (`0` + `1`) * 100) |>
+  ggplot(aes(x = Condition, y = prop)) +
+  geom_point()
+  geom_col(color = "black") +
+  scale_fill_manual(values=c("white", "red")) +
+  geom_text(aes(label = paste0(n)), position = position_stack(vjust=0.5)) +
+  theme_classic()
+  
+  
+ca_lm <- ca_data |> 
+  mutate(Responder = as.factor(Responder)) |>
+  group_by(Responder, Condition, Donor, Coverslip) |>
+  summarise(n = n()) |>
+  pivot_wider(
+    names_from = Responder,
+    values_from = n,
+  ) |>
+ mutate(prop = `1` / (`0` + `1`) * 100) 
+
+library(lme4)
+library(lmerTest)
+lm <- as.formula("prop ~ Condition + (1 | Donor) + (1 | Coverslip)")
+fit <- lmer(lm, data = ca_lm, REML = TRUE)
+summary(fit)
+capture.output(summary(fit), file = file.path(dir, paste0(measure, "_Responder.txt")))
+```
+
+
+Diff analysis for responders
+
+```{r diff, echo=FALSE}
+# Diff analysis of responder trace qualities
+measures <- c("Baseline", "Cap.ENH_PC_Response", "AUC.Cap_ENH2", "Time.to.Peak.in.Cap_ENH2", "KCl_PC_Response")
+for(measure in measures) {
+  ca_filter <- ca_data |> filter(Responder == 1)
+  
+  # t-test
+  comp <- ca_filter |> t_test(formula(paste0(measure, " ~ Condition"))) |>
+    add_significance()
+  print(comp)
+  write.csv(comp, file=file.path(dir, paste0(measure, "_Responders_T-Test_", Sys.Date(), ".csv")))
+  
+   #  wilcox
+  comp <- ca_filter |> wilcox_test(formula(paste0(measure, " ~ Condition"))) |>
+    add_significance()
+  print(comp)
+  write.csv(comp, file=file.path(dir, paste0(measure, "_Responders_Wilcox_", Sys.Date(), ".csv")))
+  
+  # shapiro
+  sw <- ca_filter |> group_by(Condition) |> shapiro_test(measure)
+  write.csv(sw, file=file.path(dir, paste0(measure, "_Responders_Shapiro_", Sys.Date(), ".csv")))
+  
+  ###BARPLOT
+  plot <- ca_filter |> group_by(Condition) |>
+    ggplot(aes(x = Condition,
+               y = .data[[measure]], base = 2)) +
+    stat_summary(aes(color = Condition), fun.data="mean_se", geom="errorbar", width = 0.2) +  # add error bars
+    stat_summary(aes(color = Condition), geom = "col", fun = "mean", position = "dodge", fill = "white") +
+    geom_point(aes(color = Condition, shape = factor(Donor)), size = 1, alpha = 0.5, position = position_jitter(width = 0.2)) +
+    scale_alpha_manual(values=c(1, 1)) +
+    scale_color_manual(values=c("black", "red")) +
+    scale_shape_manual(values=c(16,17,15)) +
+    expand_limits(x = 0, y = 0) +
+    guides(x = guide_axis(angle=45)) + # angle
+    theme_classic() +
+    theme(axis.title.x=element_blank())
+  
+  if(any(c("*", "**", "***", "****") %in% pwc$p.adj.signif)) { # stat_pvalue_manual throws an error if no signif p.adj results
+    pwc <- pwc |> add_xy_position(x = "Condition", fun = "max") # compute coords of p-values 
+   plot <- plot + stat_pvalue_manual(pwc, label = "p.adj", hide.ns = T, 
+                                     tip.length = 0.01)
+  }
+  plot
+  saveThePlot(file.path(dir, paste0(measure, "_Responders_BarPlot")),  w = 3, h = 3.5)
+  
+  
+  # violin with per-donor line plot
+  plot <- ca_filter |> group_by(Condition) |>
+    ggplot(aes(x = Condition,
+               y = .data[[measure]], base = 2)) +
+    ###VIOLIN WITH PER DONOR
+    geom_violin(aes(fill=Condition)) +
+    geom_point(aes(shape = factor(Donor)), position = position_jitter(width=0.3), 
+               size = 0.5, color="black", linewidth = 0.2, alpha = 0.3) +  # add indiv values
+    scale_shape_manual(values=c(1,2,4)) +
+    stat_summary(aes(color=factor(Donor)), fun.y="mean", geom="line", group = 1, linewidth = 0.4) +
+    stat_summary(aes(shape = factor(Donor)), fun.y="mean", geom="point", group = 1, size = 2) +  # add indiv values
+    stat_summary(aes(alpha = factor(Donor)), fun.data="mean_se", geom="errorbar", group = 1, width = 0.2) +  # add error bars
+    scale_color_manual(values=c("black", "black", "black")) +
+    scale_alpha_manual(values=c(1, 1, 1)) +
+    scale_fill_manual(values=c("white", "red")) +
+    expand_limits(x = 0, y = 0) +
+    guides(x = guide_axis(angle=45)) + # angle
+    theme_classic() +
+    theme(axis.title.x=element_blank())
+  
+  if(any(c("*", "**", "***", "****") %in% pwc$p.adj.signif)) { # stat_pvalue_manual throws an error if no signif p.adj results
+    pwc <- pwc |> add_xy_position(x = "Condition", fun = "max") # compute coords of p-values 
+    plot <- plot + stat_pvalue_manual(pwc, label = "p.adj", hide.ns = T, 
+                                      tip.length = 0.01)
+  }
+  plot
+  saveThePlot(file.path(dir, paste0(measure, "_Responders_Plot")),  w = 3, h = 3.5)
+}
+```
+Diff analysis for non-responders
+
+```{r diff, echo=FALSE}
+# Diff analysis of non-responder trace qualities
+measures <- c("Baseline", "KCl_PC_Response")
+for(measure in measures) {
+  ca_filter <- ca_data |> filter(Responder == 0)
+
+    # t-test
+  comp <- ca_filter |> t_test(formula(paste0(measure, " ~ Condition"))) |>
+    add_significance()
+  print(comp)
+  write.csv(comp, file=file.path(dir, paste0(measure, "_Non-Responders_T-Test_", Sys.Date(), ".csv")))
+   #  wilcox
+  comp <- ca_filter |> wilcox_test(formula(paste0(measure, " ~ Condition"))) |>
+    add_significance()
+  print(comp)
+  write.csv(comp, file=file.path(dir, paste0(measure, "_Non-Responders_Wilcox_", Sys.Date(), ".csv")))
+  
+  # shapiro
+  sw <- ca_filter |> group_by(Condition) |> shapiro_test(measure)
+  write.csv(sw, file=file.path(dir, paste0(measure, "_Non-Responders_Shapiro_", Sys.Date(), ".csv")))
+  
+  
+###BARPLOT
+  plot <- ca_filter |> group_by(Condition) |>
+    ggplot(aes(x = Condition,
+               y = .data[[measure]], base = 2)) +
+    stat_summary(aes(color = Condition), fun.data="mean_se", geom="errorbar", width = 0.2) +  # add error bars
+    stat_summary(aes(color = Condition), geom = "col", fun = "mean", position = "dodge", fill = "white") +
+    geom_point(aes(color = Condition, shape = factor(Donor)), size = 1, alpha = 0.5, position = position_jitter(width = 0.2)) +
+    scale_alpha_manual(values=c(1, 1)) +
+    scale_color_manual(values=c("black", "red")) +
+    scale_shape_manual(values=c(16,17,15)) +
+    expand_limits(x = 0, y = 0) +
+    guides(x = guide_axis(angle=45)) + # angle
+    theme_classic() +
+    theme(axis.title.x=element_blank())
+  
+  if(any(c("*", "**", "***", "****") %in% pwc$p.adj.signif)) { # stat_pvalue_manual throws an error if no signif p.adj results
+    pwc <- pwc |> add_xy_position(x = "Condition", fun = "max") # compute coords of p-values 
+   plot <- plot + stat_pvalue_manual(pwc, label = "p.adj", hide.ns = T, 
+                                     tip.length = 0.01)
+  }
+  plot
+  saveThePlot(file.path(dir, paste0(measure, "_Non-Responders_BarPlot")),  w = 3, h = 3.5)
+  
+  # violin with per-donor line plot
+  plot <- ca_filter |> group_by(Condition) |>
+    ggplot(aes(x = Condition,
+               y = .data[[measure]], base = 2)) +
+    ###VIOLIN WITH PER DONOR
+    geom_violin(aes(fill=Condition)) +
+    geom_point(aes(shape = factor(Donor)), position = position_jitter(width=0.3), 
+               size = 0.5, color="black", linewidth = 0.2, alpha = 0.3) +  # add indiv values
+    scale_shape_manual(values=c(1,2,4)) +
+    stat_summary(aes(color=factor(Donor)), fun.y="mean", geom="line", group = 1, linewidth = 0.4) +
+    stat_summary(aes(shape = factor(Donor)), fun.y="mean", geom="point", group = 1, size = 2) +  # add indiv values
+    scale_color_manual(values=c("black", "black", "black")) +
+    scale_alpha_manual(values=c(1, 1, 1)) +
+    scale_fill_manual(values=c("white", "red")) +
+    expand_limits(x = 0, y = 0) +
+    guides(x = guide_axis(angle=45)) + # angle
+    theme_classic() +
+    theme(axis.title.x=element_blank())
+  
+  if(any(c("*", "**", "***", "****") %in% pwc$p.adj.signif)) { # stat_pvalue_manual throws an error if no signif p.adj results
+    pwc <- pwc |> add_xy_position(x = "Condition", fun = "max") # compute coords of p-values 
+    plot <- plot + stat_pvalue_manual(pwc, label = "p.adj", hide.ns = T, 
+                                      tip.length = 0.01)
+  }
+  plot
+  saveThePlot(file.path(dir, paste0(measure, "_Non-Responders_ViolinPlot")),  w = 3, h = 3.5)
+}
+```
+
+Diff analysis for combined responders and non-responders
+
+```{r diff, echo=FALSE}
+# Diff analysis of responder trace qualities
+measures <- c("Baseline", "Cap.ENH_PC_Response", "AUC.Cap_ENH2", "Time.to.Peak.in.Cap_ENH2", "KCl_PC_Response")
+for(measure in measures) {
+  ca_filter <- ca_data
+   # t-test
+  comp <- ca_filter |> t_test(formula(paste0(measure, " ~ Condition"))) |>
+    add_significance()
+  print(comp)
+  write.csv(comp, file=file.path(dir, paste0(measure, "_Non-Responders_T-Test_", Sys.Date(), ".csv")))
+    #  wilcox
+  comp <- ca_filter |> wilcox_test(formula(paste0(measure, " ~ Condition"))) |>
+    add_significance()
+  print(comp)
+  write.csv(comp, file=file.path(dir, paste0(measure, "_AllNeurons_Wilcox_", Sys.Date(), ".csv")))
+  # shapiro
+  sw <- ca_filter |> group_by(Condition) |> shapiro_test(measure)
+  write.csv(sw, file=file.path(dir, paste0(measure, "_AllNeurons_Shapiro_", Sys.Date(), ".csv")))
+  
+  ###BARPLOT
+  plot <- ca_filter |> group_by(Condition) |>
+    ggplot(aes(x = Condition,
+               y = .data[[measure]], base = 2)) +
+    stat_summary(aes(color = Condition), fun.data="mean_se", geom="errorbar", width = 0.2) +  # add error bars
+    stat_summary(aes(color = Condition), geom = "col", fun = "mean", position = "dodge", fill = "white") +
+    geom_point(aes(color = Condition, shape = factor(Donor)), size = 1, alpha = 0.5, position = position_jitter(width = 0.2)) +
+    scale_alpha_manual(values=c(1, 1)) +
+    scale_color_manual(values=c("black", "red")) +
+    scale_shape_manual(values=c(16,17,15)) +
+    expand_limits(x = 0, y = 0) +
+    guides(x = guide_axis(angle=45)) + # angle
+    theme_classic() +
+    theme(axis.title.x=element_blank())
+  # 
+  # if(any(c("*", "**", "***", "****") %in% pwc$p.adj.signif)) { # stat_pvalue_manual throws an error if no signif p.adj results
+  #   pwc <- pwc |> add_xy_position(x = "Condition", fun = "max") # compute coords of p-values 
+  #  plot <- plot + stat_pvalue_manual(pwc, label = "p.adj", hide.ns = T, 
+  #                                    tip.length = 0.01)
+  # }
+  plot
+  saveThePlot(file.path(dir, paste0(measure, "_AllNeurons_BarPlot")),  w = 3, h = 3.5)
+  
+  # violin with per-donor line plot
+  plot <- ca_filter |> group_by(Condition) |>
+    ggplot(aes(x = Condition,
+               y = .data[[measure]], base = 2)) +
+    ###VIOLIN WITH PER DONOR
+    geom_violin(aes(fill=Condition)) +
+    geom_point(aes(shape = factor(Donor)), position = position_jitter(width=0.2), 
+               size = 0.5, color="black", linewidth = 0.2, alpha = 0.3) +  # add indiv values
+    scale_shape_manual(values=c(1,2,4)) +
+    stat_summary(aes(color=factor(Donor)), fun.y="mean", geom="line", group = 1, linewidth = 0.4) +
+    stat_summary(aes(shape = factor(Donor)), fun.y="mean", geom="point", group = 1, size = 2) +  # add indiv values
+    #stat_summary(aes(alpha = factor(Donor)), fun.data="mean_se", geom="errorbar", group = 1, width = 0.2) +  # add error bars
+    scale_color_manual(values=c("black", "black", "black")) +
+    scale_alpha_manual(values=c(1, 1, 1)) +
+    scale_fill_manual(values=c("white", "red")) +
+   # scale_fill_brewer(palette="Reds", guide = "none") +
+    #stat_summary(geom = "errorbar", fun.data = mean_se, position = "dodge") +
+    expand_limits(x = 0, y = 0) +
+    guides(x = guide_axis(angle=45)) + # angle
+    theme_classic() +
+    theme(axis.title.x=element_blank())
+  
+  # if(any(c("*", "**", "***", "****") %in% pwc$p.adj.signif)) { # stat_pvalue_manual throws an error if no signif p.adj results
+  #   pwc <- pwc |> add_xy_position(x = "Condition", fun = "max") # compute coords of p-values 
+  #   plot <- plot + stat_pvalue_manual(pwc, label = "p.adj", hide.ns = T, 
+  #                                     tip.length = 0.01)
+  # }
+  plot
+  saveThePlot(file.path(dir, paste0(measure, "_AllNeurons_ViolinPlot")),  w = 3, h = 3.5)
+}
+```
+
+Donor-aware analysis
+
+```{r donor-aware, echo=FALSE}
+library(lme4)
+library(lmerTest)
+
+measures <- c("Baseline", "Cap.ENH_PC_Response", "AUC.Cap_ENH2", "Time.to.Peak.in.Cap_ENH2", "KCl_PC_Response")
+for(measure in measures) {
+  # Non-Responders
+  ca_filter <- ca_data |> filter(Responder == 0)
+  ca_filter$Condition <- relevel(factor(ca_filter$Condition), ref = "Vehicle")
+  
+  form <- as.formula(paste(measure, "~ Condition + (1 | Donor) + (1 | Coverslip)", sep=" "))
+  fit <- lmer(form, data = ca_filter, REML = TRUE)
+  summary(fit)
+  capture.output(summary(fit), file = file.path(dir, paste0(measure, "_Non-Responder.txt")))
+  confint(fit, parm = "Condition1", method = "Wald")
+  
+  #  Responders
+  ca_filter <- ca_data |> filter(Responder == 1)
+  ca_filter$Condition <- relevel(factor(ca_filter$Condition), ref = "Vehicle")
+  
+  form <- as.formula(paste(measure, "~ Condition + (1 | Donor) + (1 | Coverslip)", sep=" "))
+  fit <- lmer(form, data = ca_filter, REML = TRUE)
+  summary(fit)
+  capture.output(summary(fit), file = file.path(dir, paste0(measure, "_Responder.txt")))
+  confint(fit, parm = "Condition1", method = "Wald")
+  
+  #  All
+  ca_filter <- ca_data
+  ca_filter$Condition <- relevel(factor(ca_filter$Condition), ref = "Vehicle")
+  
+  form <- as.formula(paste(measure, "~ Condition + (1 | Donor) + (1 | Coverslip)", sep=" "))
+  fit <- lmer(form, data = ca_filter, REML = TRUE)
+  summary(fit)
+  capture.output(summary(fit), file = file.path(dir, paste0(measure, "_AllCells.txt")))
+  confint(fit, parm = "Condition1", method = "Wald")
+}
+```

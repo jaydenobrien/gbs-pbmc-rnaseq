@@ -1,0 +1,97 @@
+---
+title: "Ca Imaging Traces from C2 Raw Output"
+author: "JAO"
+date: "2025-01-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(openxlsx)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(rstatix)
+library(ggpubr)
+source("src", "utils.R") # load custom functions
+
+comb.data <- c() # initialise place to store all data from each experiment
+```
+
+Run the following script for as many experiment files as you want to combine. They will be added to comb.data, initialised above
+
+```{r load data and add to comb.data}
+# load excel workbook containing RAW output from Nikon
+file <- file.choose() 
+#file <- file.path("Donor1", "CCL4_rawdata.xlsx")
+#file <- file.path("Donor2", "CCL4_rawdata.xlsx")
+#file <- file.path("Donor3", "CCL4_rawdata.xlsx")
+dir <- dirname(file)
+wb <- loadWorkbook(file)
+
+# concatenate all _Data (ROIs) sheets
+#df <- read.xlsx(wb, sheet = "CS1_Data (ROIs)") # load first Data (ROIs) just to get the column structure easily
+#ca.data <- df[FALSE,] # make empty data frame from the above structure so we can concatenate all the sheets
+ca.data <- data.frame() # initialise data frame
+for(sheet.name in names(wb)) {
+  if(endsWith(sheet.name, "_Data (ROIs)")) {
+    tmp <- read.xlsx(wb, sheet = sheet.name) # store temporarily
+    seq <- seq(from = 0, to = (nrow(tmp)/2)-0.5, by = 0.5) # sequence of half-seconds to replace time values with. Basically rounds down to nearest half-second to enable averaging between coverslips. Also addresses the first few measurements being at odd time intervals
+    tmp <- tmp |> mutate(`Time.[s]` = seq)
+    tmp <- tmp |> pivot_longer(cols = starts_with("#"), names_to = "Neuron", values_to = "Ratio")
+    ca.data <- rbind(ca.data, tmp)
+  }
+}
+# simplify the cell numbers from the raw data
+ca.data <- ca.data |> mutate(Neuron = gsub("#", "", str_extract(Neuron, "(#)\\d*"))) |>
+  filter(`Time.[s]` < 400.1)
+
+# assign conditions
+## NOTE:  This adds metadata to know what conditions the sheets belong to.
+##        You must manually add a sheet titled "Metadata" to the Output_excel_file in the same directory as the   
+##        raw data file for this to work. Column names should be "Coverslip" (CS1, CS2, etc.) and "Group"
+ca.data <- ca.data |> mutate(Coverslip = gsub("CS", "", str_extract(Name, "CS\\d*"))) |> # add coverslip name from file name
+  mutate(Coverslip = as.integer(Coverslip)) |> mutate(Coverslip = as.character(Coverslip))
+
+meta <- read.xlsx(wb, sheet = "Metadata") # extract condition metadata from output file
+meta <- meta |> mutate(Coverslip = as.character(Coverslip))
+ca.data <- left_join(ca.data, meta, by="Coverslip") # join condition information to main table
+
+# filter out junk traces
+exclude <- read.xlsx(wb, sheet = "MASTER") |>  # read cells to exclude
+  mutate(Cell_Number = gsub("#", "", str_extract(Cell_Number, "(#)\\d*"))) |> # simplify cell numbers so they are the same as the raw file
+  mutate(Coverslip = as.character(Coverslip))
+ca.data <- left_join(ca.data, exclude, by=join_by(Group, Coverslip, "Neuron" == "Cell_Number"))
+ca.data <- ca.data |> filter(Exclude == "N")
+
+comb.data <- rbind(comb.data, ca.data)
+```
+
+```{r combine data}
+# generate means and SD
+sem <- function(x) sd(x)/sqrt(length(x)) # define sem function
+sum.data <- comb.data |> group_by(Group, `Time.[s]`) |> summarise(mean = mean(Ratio), se = sem(Ratio))
+```
+
+```{r plot data}
+### SETTINGS:
+intercepts <- c(90,210,330) # for regular cap protocol
+#intercepts <- c(90,510,630) # for the direct drug protocol (Donor 6)
+
+# plot summary graph from summary table sum.data
+sum.data$Group <- factor(sum.data$Group, levels=c(
+  "Vehicle", "CCL4" # set variable order on graph
+))
+sum.data |> ungroup() |> ggplot(aes(
+  x = `Time.[s]`
+)) + geom_line(aes(y = mean, colour = Group)) + 
+  geom_ribbon(aes(y = mean, ymin = mean - se, ymax = mean + se, fill = Group), alpha = 0.2) + 
+  geom_vline(xintercept=intercepts, linetype='dashed', color='black', linewidth=0.5) + # manually add x-intercept lines to mark solution changes
+  scale_colour_manual(values=c("black", "red")) + scale_fill_manual(values=c("gray", "red")) +
+  theme_classic() +
+  labs(x = "Time (s)", y = "Mean 340/380 Ratio, KCl-Responsive Neurons")
+
+# save graph to file
+saveThePlot(file.path("Combined_Trace"), w = 6, h = 4)
+```
